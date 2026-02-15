@@ -1,1 +1,0 @@
-# misis2026s-23-03-lelikov-s-s
