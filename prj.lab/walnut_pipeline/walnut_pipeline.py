@@ -560,7 +560,7 @@ if __name__ == '__main__':
         if not os.path.exists(path):
             continue
         print(f'Processing {fname} (debug={debug_mode})...')
-        debug_dir = f'/mnt/user-data/outputs/debug_{fname[:-5]}' if debug_mode else None
+        debug_dir = f'C:\\masks_test\\output\\debug_{fname[:-5]}' if debug_mode else None
         r = process_slice(path, debug=debug_mode, output_dir=debug_dir)
         ov = make_overlay(r)
         cv2.putText(ov, f"si={r['si']}", (5, 18),
