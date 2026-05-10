@@ -1,10 +1,21 @@
 """
-Walnut X-ray CT Slice Segmentation Pipeline v3
+Walnut X-ray CT Slice Segmentation Pipeline
 Stages: A (walnut mask) → C (shell) → D (kernel) → E (partitions)
 """
 
 import cv2
 import numpy as np
+
+_orig_percentile = np.percentile
+
+def _safe_percentile(a, q, *args, **kwargs):
+    a = np.asarray(a)
+    if a.size == 0:
+        return 0.0  # int(0.0) = 0, порог сработает безопасно
+    return _orig_percentile(a, q, *args, **kwargs)
+
+np.percentile = _safe_percentile
+
 import tifffile
 import re
 from collections import deque
@@ -16,19 +27,19 @@ from skimage.filters import frangi
 # Формат: (si, value). Вне диапазона анкоров — берётся ближайшее значение.
 PARAM_ANCHORS = {
     # Скорлупа: процентиль яркости для порога
-    'shell_pct':        [(49, 26),   (79, 73),   (259, 88)],
+    'shell_pct':        [(69, 26),   (79, 36), (88, 46),  (259, 88), (390, 88), (391, 65), (407, 32), (433, 20)],
 
     # Ядро: процентиль яркости для seeds
-    'seed_pct':         [(0, 92),    (69, 92),   (70, 85),   (500, 85)],
+    'seed_pct':         [(0, 92),    (69, 92),   (70, 85), (391, 85), (500, 85)],
 
     # Ядро: фильтр формы
     'solidity_min':     [(0, 0.60),  (79, 0.60), (80, 0.55), (500, 0.55)],
     'aspect_min':       [(0, 0.40),  (79, 0.40), (80, 0.35), (500, 0.35)],
 
     # Перегородки: пороги
-    'frangi_pct':       [(49, 85),   (259, 85)],
-    'ring_bright_pct':  [(49, 70),   (259, 70)],
-    'bright_filter_pct':[(49, 50),   (259, 50)],
+    'frangi_pct':       [(69, 85),   (259, 85)],
+    'ring_bright_pct':  [(69, 70),   (259, 70)],
+    'bright_filter_pct':[(69, 50),   (259, 50)],
 }
 
 # ── si-независимые параметры ───────────────────────────────────────────────
@@ -39,7 +50,8 @@ AREA_FRAC      = 0.005 # min lobe area fraction
 EXPAND_TOL     = 25    # BFS expand tolerance (si <= 69)
 SHELL_CLOSE_PX = 5     # morph close для si == 69
 HOLE_FRAC_MAX  = 0.10
-KERNEL_MIN_SI  = 50    # срезы ниже этого значения не имеют ядра (si <= 49)
+KERNEL_MIN_SI  = 83    # срезы ниже этого значения не имеют ядра (si <= 83)
+KERNEL_MAX_SI  = 383   # срезы выше этого значения не имеют ядра (si <= 390)
 
 # Partitions (стадия E) — структурные параметры (не зависят от si)
 FRANGI_INTERIOR_ERODE = 3
@@ -123,11 +135,11 @@ def build_shell(bl, mask, si, save=None):
     max_area = areas[0][0]
     shi = np.zeros_like(bl)
 
-    if si > 69:
+    if si > 88:
         shi[lb == areas[0][1]] = 255
         shell = cv2.bitwise_or(shi, outer)
 
-    elif si == 69:
+    elif si == 88:
         for a, idx in areas:
             if a >= max_area * 0.9:
                 shi[lb == idx] = 255
@@ -162,7 +174,7 @@ def build_shell(bl, mask, si, save=None):
             shi[lb == idx] = 255
         shell = shi
 
-    if si <= 69:
+    if si <= 88:
         k_cl = cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE, (2 * SHELL_CLOSE_PX + 1, 2 * SHELL_CLOSE_PX + 1))
         shell = cv2.bitwise_and(cv2.morphologyEx(shell, cv2.MORPH_CLOSE, k_cl), mask)
@@ -251,6 +263,8 @@ def shape_ok(comp_mask, sol_min, asp_min):
 
 def build_kernel(bl, interior, si, save=None):
     if si < KERNEL_MIN_SI:  # si <= 49 — нет ядра
+        return np.zeros_like(bl)
+    if si > KERNEL_MAX_SI:   # срез слишком высокий — ядра уже нет
         return np.zeros_like(bl)
     int_area = int((interior > 0).sum())
     if int_area == 0:
@@ -483,7 +497,7 @@ def make_overlay(r):
 
 # ── Запуск ─────────────────────────────────────────────────────────────────
 
-def process_all(input_dir, output_dir='/mnt/user-data/outputs', debug=False,
+def process_all(input_dir, output_dir='C:\\masks_test\\output', debug=False,
                 progress_every=50):
     """
     Обработать все .tiff срезы в input_dir.
@@ -511,64 +525,103 @@ def process_all(input_dir, output_dir='/mnt/user-data/outputs', debug=False,
 
 
 if __name__ == '__main__':
-    import sys, os
+    import sys
+    import os
+    import argparse
+    import traceback
 
-    # Если есть аргумент 'debug' — включаем режим отладки на тестовых срезах
-    debug_mode = 'debug' in sys.argv
+    # === НАСТРОЙКА АРГУМЕНТОВ ===
+    parser = argparse.ArgumentParser(
+        description="Обработка TIFF-срезов: режим all (все файлы) или test (выборочные)"
+    )
+    parser.add_argument('--mode', choices=['all', 'test'], default='test',
+                        help="Режим: 'all' — все файлы, 'test' — выборочные срезы")
+    parser.add_argument('--input-dir', default=r'C:\masks_test',
+                        help="Путь к папке с входными TIFF-файлами")
+    parser.add_argument('--output-dir', default=r'C:\masks_test\output',
+                        help="Путь к папке для сохранения результатов")
+    parser.add_argument('--debug', action='store_true',
+                        help="Включить режим отладки (сохранение промежуточных шагов)")
+    parser.add_argument('--skip-errors', action='store_true',
+                        help="Продолжать обработку при ошибке на отдельном срезе")
+    args = parser.parse_args()
 
-    BASE = 'C:\\masks_test'
-    test_slices = [
-        'full_AGD_50_000077.tiff',
-        'full_AGD_50_000087.tiff',
-        'full_AGD_50_000097.tiff',
-        'full_AGD_50_000107.tiff',
-        'full_AGD_50_000117.tiff',
-        'full_AGD_50_000127.tiff',
-        'full_AGD_50_000137.tiff',
-        'full_AGD_50_000147.tiff',
-        'full_AGD_50_000157.tiff',
-        'full_AGD_50_000167.tiff',
-        'full_AGD_50_000177.tiff',
-        'full_AGD_50_000187.tiff',
-        'full_AGD_50_000197.tiff',
-        'full_AGD_50_000207.tiff',
-        'full_AGD_50_000217.tiff',
-        'full_AGD_50_000227.tiff',
-        'full_AGD_50_000237.tiff',
-        'full_AGD_50_000247.tiff',
-        'full_AGD_50_000257.tiff',
-        'full_AGD_50_000259.tiff',
-        'full_AGD_50_000267.tiff',
-        'full_AGD_50_000277.tiff',
-        'full_AGD_50_000287.tiff',
-        'full_AGD_50_000297.tiff',
-        'full_AGD_50_000309.tiff',
-        'full_AGD_50_000319.tiff',
-        'full_AGD_50_000329.tiff',
-        'full_AGD_50_000339.tiff',
-        'full_AGD_50_000349.tiff',
-        'full_AGD_50_000359.tiff',
-        'full_AGD_50_000369.tiff',
-        'full_AGD_50_000379.tiff',
-        'full_AGD_50_000389.tiff',
-        'full_AGD_50_000399.tiff',
-    ]
+    INPUT_DIR  = args.input_dir
+    OUTPUT_DIR = args.output_dir
+    debug_mode = args.debug
+    skip_errors = args.skip_errors
 
-    panels = []
-    for fname in test_slices:
-        path = f'{BASE}/{fname}'
-        if not os.path.exists(path):
-            continue
-        print(f'Processing {fname} (debug={debug_mode})...')
-        debug_dir = f'C:\\masks_test\\output\\debug_{fname[:-5]}' if debug_mode else None
-        r = process_slice(path, debug=debug_mode, output_dir=debug_dir)
-        ov = make_overlay(r)
-        cv2.putText(ov, f"si={r['si']}", (5, 18),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        panels.append(ov)
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    if panels:
-        grid = cv2.hconcat(panels)
-        out_path = "C:\\masks_test\\output\\output.png"
-        cv2.imwrite(out_path, grid)
-        print(f'Saved → {out_path}')
+    # === ЛОГИКА ОБРАБОТКИ ===
+    if args.mode == 'all':
+        print(f"\n[🟢] Режим: ALL. Обработка всех файлов из '{INPUT_DIR}'...")
+        try:
+            process_all(INPUT_DIR, OUTPUT_DIR, debug=debug_mode, progress_every=10)
+            print("[✅] Пакетная обработка завершена.")
+        except Exception as e:
+            print(f"[❌] Критическая ошибка при пакетной обработке: {e}")
+            if debug_mode:
+                traceback.print_exc()
+            if not skip_errors:
+                print("[🛑] Прерывание. Используйте --skip-errors для продолжения.")
+                sys.exit(1)
+
+    elif args.mode == 'test':
+        print(f"\n[🔵] Режим: TEST. Обработка выбранных срезов...")
+        test_slices = [
+            'full_AGD_50_000077.tiff',
+            'full_AGD_50_000087.tiff',
+            'full_AGD_50_000097.tiff',
+            'full_AGD_50_000107.tiff',
+            'full_AGD_50_000117.tiff',
+            'full_AGD_50_000127.tiff',
+            'full_AGD_50_000137.tiff',
+        ]
+
+        panels = []
+        failed = []
+        for fname in test_slices:
+            path = os.path.join(INPUT_DIR, fname)
+            if not os.path.exists(path):
+                print(f"[⚠️]  Файл не найден: {path}")
+                continue
+
+            print(f"[⚙️]  Processing {fname} (debug={debug_mode})...")
+            try:
+                debug_dir = os.path.join(OUTPUT_DIR, f'debug_{fname[:-5]}') if debug_mode else None
+                r = process_slice(path, debug=debug_mode, output_dir=debug_dir)
+                
+                ov = make_overlay(r)
+                cv2.putText(ov, f"si={r['si']}", (5, 18),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                panels.append(ov)
+                
+                cv2.imwrite(os.path.join(OUTPUT_DIR, f'overlay_si{r["si"]:03d}.png'), ov)
+                print(f"[✅] {fname} обработан успешно.")
+                
+            except Exception as e:
+                print(f"[❌] Ошибка при обработке {fname}: {e}")
+                if debug_mode:
+                    traceback.print_exc()
+                failed.append(fname)
+                if not skip_errors:
+                    print("[🛑] Прерывание. Используйте --skip-errors для продолжения.")
+                    sys.exit(1)
+                continue
+
+        # === Сборка сетки результатов ===
+        if panels:
+            if all(p.shape[0] == panels[0].shape[0] for p in panels):
+                grid = cv2.hconcat(panels)
+                out_path = os.path.join(OUTPUT_DIR, 'output.png')
+                cv2.imwrite(out_path, grid)
+                print(f"[✅] Сетка сохранена -> {out_path}")
+            else:
+                print("[⚠️]  Не удалось собрать сетку: изображения имеют разную высоту.")
+        else:
+            print("[ℹ️]  Ни один файл не был успешно обработан.")
+
+        if failed:
+            print(f"\n[📊] Итог: успешно {len(panels)}, ошибок {len(failed)}.")
+            print("Проблемные файлы:", failed)
