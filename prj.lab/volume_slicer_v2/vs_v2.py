@@ -63,7 +63,7 @@ def slice_volume(image_paths):
 
 
 def main():
-    input_dir = Path(r"C:\masks_test\output")
+    input_dir = Path(r"C:\masks_test\out")
 
     image_paths = [
         p for p in input_dir.iterdir()

@@ -1,21 +1,10 @@
 """
-Walnut X-ray CT Slice Segmentation Pipeline
+Walnut X-ray CT Slice Segmentation Pipeline v3
 Stages: A (walnut mask) → C (shell) → D (kernel) → E (partitions)
 """
 
 import cv2
 import numpy as np
-
-_orig_percentile = np.percentile
-
-def _safe_percentile(a, q, *args, **kwargs):
-    a = np.asarray(a)
-    if a.size == 0:
-        return 0.0  # int(0.0) = 0, порог сработает безопасно
-    return _orig_percentile(a, q, *args, **kwargs)
-
-np.percentile = _safe_percentile
-
 import tifffile
 import re
 from collections import deque
@@ -27,31 +16,37 @@ from skimage.filters import frangi
 # Формат: (si, value). Вне диапазона анкоров — берётся ближайшее значение.
 PARAM_ANCHORS = {
     # Скорлупа: процентиль яркости для порога
-    'shell_pct':        [(69, 26),   (79, 36), (88, 46),  (259, 88), (390, 88), (391, 65), (407, 32), (433, 20)],
+    'shell_pct':        [(49, 26), (51, 30), (69, 55), (70, 69), (79, 73),   (259, 88),  (396, 80),  (408, 74),  (413, 65),  (420, 45),  (440, 50)],
 
     # Ядро: процентиль яркости для seeds
-    'seed_pct':         [(0, 92),    (69, 92),   (70, 85), (391, 85), (500, 85)],
+    'seed_pct':         [(0, 50),    (83, 50), (84, 55), (89, 55), (90, 65), (94,65), (95, 70), (96, 65), (99, 65), (100, 85), (370, 85), (371, 92), (384, 96),    (500, 99)],
+
+    # Ядро: минимальная площадь лоба как доля от площади interior.
+    # Анкоры сейчас даёт постоянное 0.015 — добавь точки чтобы настроить per-si.
+    'area_frac':        [(0, 0.015), (83, 0.015), (84, 0.02), (96, 0.025), (87, 0.02), (130, 0.025), (131,0.015), (500, 0.015)],
 
     # Ядро: фильтр формы
-    'solidity_min':     [(0, 0.60),  (79, 0.60), (80, 0.55), (500, 0.55)],
-    'aspect_min':       [(0, 0.40),  (79, 0.40), (80, 0.35), (500, 0.35)],
+    'solidity_min':     [(0, 0.60),  (79, 0.50), (80, 0.55), (87, 0.57), (100, 0.59), (130, 0.65), (131, 0.55), (500, 0.55)],
+    'aspect_min':       [(0, 0.40),  (79, 0.40), (80, 0.35), (87, 0.50), (130, 0.55), (131, 0.35), (210, 0.35), (211, 0.20), (215, 0.25), (216,0.35), (229, 0.35), (230, 0.25), (269, 0.30), (270, 0.35), (286, 0.35), (287, 0.20), (305, 0.16), (317, 0.20), (318, 0.30), (500, 0.35)],
 
     # Перегородки: пороги
-    'frangi_pct':       [(69, 85),   (259, 85)],
-    'ring_bright_pct':  [(69, 70),   (259, 70)],
-    'bright_filter_pct':[(69, 50),   (259, 50)],
+    'frangi_pct':       [(49, 85),   (259, 85)],
+    'ring_bright_pct':  [(49, 70),   (259, 70)],
+    'bright_filter_pct':[(49, 50),   (259, 50)],
+
+    # Маска ореха: процентиль для малых si (вместо OTSU)
+    'mask_pct':          [(0, 96),    (37, 99),   (38, 98),   (49, 96),   (50, 0),    (500, 0)],
 }
 
 # ── si-независимые параметры ───────────────────────────────────────────────
 # Kernel
 TOLERANCE      = 20    # region growing tolerance
 DT_PCT         = 80    # distance transform percentile (si <= 69)
-AREA_FRAC      = 0.005 # min lobe area fraction
 EXPAND_TOL     = 25    # BFS expand tolerance (si <= 69)
 SHELL_CLOSE_PX = 5     # morph close для si == 69
 HOLE_FRAC_MAX  = 0.10
-KERNEL_MIN_SI  = 83    # срезы ниже этого значения не имеют ядра (si <= 83)
-KERNEL_MAX_SI  = 383   # срезы выше этого значения не имеют ядра (si <= 390)
+KERNEL_MIN_SI  = 84    # срезы ниже этого значения не имеют ядра (si <= 49)
+KERNEL_MAX_SI  = 383   # срезы выше этого значения не имеют ядра (si >= 384)
 
 # Partitions (стадия E) — структурные параметры (не зависят от si)
 FRANGI_INTERIOR_ERODE = 3
@@ -84,24 +79,66 @@ def interp_param(name, si):
 
 def load_slice(path):
     raw = tifffile.imread(path).astype(np.float32)
+    # перцентильное клиппирование — убираем выбросы (топ и низ 1%)
+    # защищает от артефактов которые сжимают орех в серый диапазон
+    p_low  = np.percentile(raw, 1)
+    p_high = np.percentile(raw, 99)
+    raw = np.clip(raw, p_low, p_high)
     img = cv2.normalize(raw, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
     bl  = cv2.medianBlur(img, 5)
-    fname = path.split('/')[-1]
+    fname = path.replace(chr(92), '/').split('/')[-1]
     m = re.search(r'(\d+)(?=\.tiff?$)', fname, re.IGNORECASE)
     si = int(m.group(1)) if m else 0
     return img, bl, si
-
-
 # ── Стадия A: маска ореха ──────────────────────────────────────────────────
 
-def build_walnut_mask(bl, save=None):
-    _, bn = cv2.threshold(bl, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    if save: save('threshold_otsu', bn)
+def build_walnut_mask(bl, si=0, save=None):
+    # для малых si (<=49): opening r=5 убирает шум + p99 вместо OTSU
+    mask_pct = interp_param('mask_pct', si)
+    if mask_pct > 0:
+        # очистка от шума через opening
+        ke_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))  # r=5
+        bl_clean = cv2.morphologyEx(bl, cv2.MORPH_OPEN, ke_open)
+        if save: save('morphOpen_denoise', bl_clean)
+        nz = bl_clean[bl_clean > 0]
+        # ищем наименьший pct начиная с mask_pct который даёт t < 255
+        t = 255
+        actual_pct = mask_pct
+        for try_pct in range(int(mask_pct), 50, -1):
+            t_try = int(np.percentile(nz, try_pct)) if len(nz) > 0 else 0
+            if t_try < 250:
+                t = t_try
+                actual_pct = try_pct
+                break
+        _, bn = cv2.threshold(bl_clean, t, 255, cv2.THRESH_BINARY)
+        if save: save(f'threshold_p{actual_pct:.0f}_t{t}', bn)
+    else:
+        # обычный OTSU для больших si
+        _, bn = cv2.threshold(bl, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        if save: save('threshold_otsu', bn)
+
     k7 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
     cl = cv2.morphologyEx(bn, cv2.MORPH_CLOSE, k7)
     if save: save('morphologyEx_close', cl)
     cs, _ = cv2.findContours(cl, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    valid = [c for c in cs if cv2.contourArea(c) >= 5000]
+    H, W = bl.shape
+    cx_img, cy_img = W // 2, H // 2
+    max_dist = min(H, W) * 0.4
+    min_area = 500 if mask_pct > 0 else 5000  # меньший порог для малых si
+    valid = []
+    for c in cs:
+        if cv2.contourArea(c) < min_area:
+            continue
+        M = cv2.moments(c)
+        if M['m00'] == 0:
+            continue
+        cx = int(M['m10'] / M['m00'])
+        cy = int(M['m01'] / M['m00'])
+        dist = np.sqrt((cx - cx_img)**2 + (cy - cy_img)**2)
+        if dist <= max_dist:
+            valid.append(c)
+    if not valid:
+        valid = [c for c in cs if cv2.contourArea(c) >= min_area]
     mask = np.zeros_like(bl)
     if valid:
         cv2.drawContours(mask, [max(valid, key=cv2.contourArea)], -1, 255, cv2.FILLED)
@@ -111,9 +148,16 @@ def build_walnut_mask(bl, save=None):
     return mask
 
 
-# ── Стадия C: маска скорлупы ───────────────────────────────────────────────
+# ── Стадия B: маска скорлупы ───────────────────────────────────────────────
 
 def build_shell(bl, mask, si, save=None):
+    # для малых si (нет ядра) — вся маска является скорлупой
+    if si < KERNEL_MIN_SI:
+        if save: save('shell_result', mask)
+        interior = np.zeros_like(bl)
+        if save: save('interior_result', interior)
+        return mask.copy(), interior
+
     p = int(round(interp_param('shell_pct', si)))
     k3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
     me = cv2.erode(mask, k3)
@@ -135,17 +179,17 @@ def build_shell(bl, mask, si, save=None):
     max_area = areas[0][0]
     shi = np.zeros_like(bl)
 
-    if si > 88:
+    if si > 70:
         shi[lb == areas[0][1]] = 255
         shell = cv2.bitwise_or(shi, outer)
 
-    elif si == 88:
+    elif si >= 50:  # si 50-70: берём все компоненты с ratio >= 0.9 (скорлупа может быть в двух частях)
         for a, idx in areas:
             if a >= max_area * 0.9:
                 shi[lb == idx] = 255
-        shell = shi
+        shell = cv2.bitwise_or(shi, outer)
 
-    else:  # si < 69
+    else:  # si < 50
         candidates = {}
         for a, idx in areas:
             mb = float(bl[lb == idx].mean())
@@ -174,7 +218,7 @@ def build_shell(bl, mask, si, save=None):
             shi[lb == idx] = 255
         shell = shi
 
-    if si <= 88:
+    if si <= 69:
         k_cl = cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE, (2 * SHELL_CLOSE_PX + 1, 2 * SHELL_CLOSE_PX + 1))
         shell = cv2.bitwise_and(cv2.morphologyEx(shell, cv2.MORPH_CLOSE, k_cl), mask)
@@ -191,7 +235,7 @@ def build_shell(bl, mask, si, save=None):
     return shell, interior
 
 
-# ── Стадия D: маска ядра ───────────────────────────────────────────────────
+# ── Стадия C: маска ядра ───────────────────────────────────────────────────
 
 def region_growing(bl, interior, seed_pct):
     H, W = bl.shape
@@ -262,14 +306,13 @@ def shape_ok(comp_mask, sol_min, asp_min):
 
 
 def build_kernel(bl, interior, si, save=None):
-    if si < KERNEL_MIN_SI:  # si <= 49 — нет ядра
-        return np.zeros_like(bl)
-    if si > KERNEL_MAX_SI:   # срез слишком высокий — ядра уже нет
+    if si < KERNEL_MIN_SI or si > KERNEL_MAX_SI:  # нет ядра вне диапазона
         return np.zeros_like(bl)
     int_area = int((interior > 0).sum())
     if int_area == 0:
         return np.zeros_like(bl)
-    min_lobe = max(50, int(int_area * AREA_FRAC))
+    area_frac = interp_param('area_frac', si)
+    min_lobe = max(50, int(int_area * area_frac))
 
     seed_pct = interp_param('seed_pct', si)
     sol_min = interp_param('solidity_min', si)
@@ -312,7 +355,7 @@ def build_kernel(bl, interior, si, save=None):
         return result
 
 
-# ── Стадия E: маска перегородок ────────────────────────────────────────────
+# ── Стадия D: маска перегородок ────────────────────────────────────────────
 
 def build_partitions(bl, interior, kernel, shell=None, mask=None, si=259, save=None):
     if shell is None: shell = np.zeros_like(bl)
@@ -332,11 +375,15 @@ def build_partitions(bl, interior, kernel, shell=None, mask=None, si=259, save=N
     if save: save('dilate_kernel', kernel_d)
 
     work = cv2.bitwise_and(bl, bl, mask=interior_eroded).astype(np.float32) / 255.0
+    if interior_eroded.sum() == 0:
+        # пустой interior — нет перегородок
+        return np.zeros_like(bl)
     fo   = frangi(work, sigmas=FRANGI_SIGMAS, black_ridges=False)
     fo[interior_eroded == 0] = 0
     fn = cv2.normalize(fo, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
     if save: save('frangi_response', fn)
-    ft = int(np.percentile(fn[interior_eroded > 0], frangi_pct))
+    fn_vals = fn[interior_eroded > 0]
+    ft = int(np.percentile(fn_vals, frangi_pct)) if len(fn_vals) > 0 else 0
     _, fb = cv2.threshold(fn, ft, 255, cv2.THRESH_BINARY)
     if save: save(f'threshold_frangi_p{frangi_pct}', fb)
     fb = cv2.bitwise_and(fb, interior_eroded)
@@ -454,7 +501,7 @@ def process_slice(path, debug=False, output_dir=None):
             save(f'{func_name}__{step_name}', image)
         return _save
 
-    mask = build_walnut_mask(bl, save=make_saver('build_walnut_mask'))
+    mask = build_walnut_mask(bl, si=si, save=make_saver('build_walnut_mask'))
 
     # ── Стадия C ──────────────────────────────────────────────────────────
     shell, interior = build_shell(bl, mask, si, save=make_saver('build_shell'))
@@ -497,131 +544,103 @@ def make_overlay(r):
 
 # ── Запуск ─────────────────────────────────────────────────────────────────
 
-def process_all(input_dir, output_dir='C:\\masks_test\\output', debug=False,
-                progress_every=50):
+def process_all(input_dir, output_dir='out', debug=False, progress_every=50):
     """
-    Обработать все .tiff срезы в input_dir.
-    progress_every — выводить прогресс каждые N срезов (по умолчанию 50).
+    Обработать все .tiff/.tif срезы в input_dir.
+    progress_every — выводить прогресс каждые N срезов.
     debug=True — для каждого среза сохранить промежуточные шаги.
     """
     import os
-    files = sorted(f for f in os.listdir(input_dir) if f.lower().endswith('.tiff'))
+    print(f'[INFO] input_dir = {input_dir}')
+    print(f'[INFO] output_dir = {output_dir}')
+    print(f'[INFO] папка существует: {os.path.isdir(input_dir)}')
+
+    if not os.path.isdir(input_dir):
+        print(f'[ERROR] Папка не найдена: {input_dir}')
+        return
+
+    all_files = os.listdir(input_dir)
+    print(f'[INFO] всего файлов в папке: {len(all_files)}')
+    if all_files:
+        print(f'[INFO] первые 5 файлов: {all_files[:5]}')
+
+    files = sorted(f for f in all_files
+                   if f.lower().endswith('.tiff') or f.lower().endswith('.tif'))
     total = len(files)
-    print(f'Найдено {total} срезов в {input_dir}')
+    print(f'[INFO] найдено TIFF срезов: {total}')
+
+    if total == 0:
+        print('[ERROR] TIFF файлы не найдены. Проверь расширение и путь.')
+        return
 
     os.makedirs(output_dir, exist_ok=True)
+    errors = 0
+
     for i, fname in enumerate(files, start=1):
         path = os.path.join(input_dir, fname)
         debug_dir = os.path.join(output_dir, f'debug_{fname[:-5]}') if debug else None
-        r = process_slice(path, debug=debug, output_dir=debug_dir)
-        ov = make_overlay(r)
-        out_path = os.path.join(output_dir, f'overlay_si{r["si"]:03d}.png')
-        cv2.imwrite(out_path, ov)
+        try:
+            r = process_slice(path, debug=debug, output_dir=debug_dir)
+            ov = make_overlay(r)
+            out_path = os.path.join(output_dir, f'overlay_si{r["si"]:03d}.png')
+            cv2.imwrite(out_path, ov)
+        except Exception as e:
+            errors += 1
+            print(f'  [!] ошибка на {fname}: {e}')
+            continue
 
         if i % progress_every == 0 or i == total:
             print(f'  обработано {i}/{total}  (последний si={r["si"]})')
 
-    print(f'Готово. Результаты: {output_dir}')
+    print(f'Готово. Результаты: {output_dir}  Ошибок: {errors}')
 
 
 if __name__ == '__main__':
     import sys
     import os
-    import argparse
-    import traceback
 
-    # === НАСТРОЙКА АРГУМЕНТОВ ===
-    parser = argparse.ArgumentParser(
-        description="Обработка TIFF-срезов: режим all (все файлы) или test (выборочные)"
-    )
-    parser.add_argument('--mode', choices=['all', 'test'], default='test',
-                        help="Режим: 'all' — все файлы, 'test' — выборочные срезы")
-    parser.add_argument('--input-dir', default=r'C:\masks_test',
-                        help="Путь к папке с входными TIFF-файлами")
-    parser.add_argument('--output-dir', default=r'C:\masks_test\output',
-                        help="Путь к папке для сохранения результатов")
-    parser.add_argument('--debug', action='store_true',
-                        help="Включить режим отладки (сохранение промежуточных шагов)")
-    parser.add_argument('--skip-errors', action='store_true',
-                        help="Продолжать обработку при ошибке на отдельном срезе")
-    args = parser.parse_args()
+    debug_mode = 'debug' in sys.argv
 
-    INPUT_DIR  = args.input_dir
-    OUTPUT_DIR = args.output_dir
-    debug_mode = args.debug
-    skip_errors = args.skip_errors
-
+    # === НАСТРОЙКА ПУТЕЙ ===
+    INPUT_DIR  = r'C:\masks_test'
+    OUTPUT_DIR = r'C:\masks_test\out'
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    # === ЛОГИКА ОБРАБОТКИ ===
-    if args.mode == 'all':
-        print(f"\n[🟢] Режим: ALL. Обработка всех файлов из '{INPUT_DIR}'...")
-        try:
-            process_all(INPUT_DIR, OUTPUT_DIR, debug=debug_mode, progress_every=10)
-            print("[✅] Пакетная обработка завершена.")
-        except Exception as e:
-            print(f"[❌] Критическая ошибка при пакетной обработке: {e}")
-            if debug_mode:
-                traceback.print_exc()
-            if not skip_errors:
-                print("[🛑] Прерывание. Используйте --skip-errors для продолжения.")
-                sys.exit(1)
+    # Режим: 'all' — все файлы, 'test' — только выбранные срезы
+    MODE = 'all'  # 'all' или 'test'
 
-    elif args.mode == 'test':
-        print(f"\n[🔵] Режим: TEST. Обработка выбранных срезов...")
+    if MODE == 'all':
+        # Обработать ВСЕ файлы в папке
+        process_all(INPUT_DIR, OUTPUT_DIR, debug=debug_mode, progress_every=10)
+
+    elif MODE == 'test':
+        # Обработать ТОЛЬКО ВЫБРАННЫЕ файлы
         test_slices = [
-            'full_AGD_50_000077.tiff',
-            'full_AGD_50_000087.tiff',
-            'full_AGD_50_000097.tiff',
-            'full_AGD_50_000107.tiff',
-            'full_AGD_50_000117.tiff',
-            'full_AGD_50_000127.tiff',
-            'full_AGD_50_000137.tiff',
+            'full_AGD_50_000049.tiff',
+            'full_AGD_50_000059.tiff',
+            'full_AGD_50_000069.tiff',
+            'full_AGD_50_000079.tiff',
+            'full_AGD_50_000259.tiff',
         ]
-
         panels = []
-        failed = []
         for fname in test_slices:
             path = os.path.join(INPUT_DIR, fname)
             if not os.path.exists(path):
-                print(f"[⚠️]  Файл не найден: {path}")
+                print(f'[!] Файл не найден: {path}')
                 continue
 
-            print(f"[⚙️]  Processing {fname} (debug={debug_mode})...")
-            try:
-                debug_dir = os.path.join(OUTPUT_DIR, f'debug_{fname[:-5]}') if debug_mode else None
-                r = process_slice(path, debug=debug_mode, output_dir=debug_dir)
-                
-                ov = make_overlay(r)
-                cv2.putText(ov, f"si={r['si']}", (5, 18),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                panels.append(ov)
-                
-                cv2.imwrite(os.path.join(OUTPUT_DIR, f'overlay_si{r["si"]:03d}.png'), ov)
-                print(f"[✅] {fname} обработан успешно.")
-                
-            except Exception as e:
-                print(f"[❌] Ошибка при обработке {fname}: {e}")
-                if debug_mode:
-                    traceback.print_exc()
-                failed.append(fname)
-                if not skip_errors:
-                    print("[🛑] Прерывание. Используйте --skip-errors для продолжения.")
-                    sys.exit(1)
-                continue
+            print(f'Processing {fname} (debug={debug_mode})...')
+            debug_dir = os.path.join(OUTPUT_DIR, f'debug_{fname[:-5]}') if debug_mode else None
+            r = process_slice(path, debug=debug_mode, output_dir=debug_dir)
+            ov = make_overlay(r)
+            cv2.putText(ov, f"si={r['si']}", (5, 18),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            panels.append(ov)
 
-        # === Сборка сетки результатов ===
-        if panels:
-            if all(p.shape[0] == panels[0].shape[0] for p in panels):
-                grid = cv2.hconcat(panels)
-                out_path = os.path.join(OUTPUT_DIR, 'output.png')
-                cv2.imwrite(out_path, grid)
-                print(f"[✅] Сетка сохранена -> {out_path}")
-            else:
-                print("[⚠️]  Не удалось собрать сетку: изображения имеют разную высоту.")
-        else:
-            print("[ℹ️]  Ни один файл не был успешно обработан.")
+            cv2.imwrite(os.path.join(OUTPUT_DIR, f'overlay_si{r["si"]:03d}.png'), ov)
 
-        if failed:
-            print(f"\n[📊] Итог: успешно {len(panels)}, ошибок {len(failed)}.")
-            print("Проблемные файлы:", failed)
+        if panels and all(p.shape[0] == panels[0].shape[0] for p in panels):
+            grid = cv2.hconcat(panels)
+            out_path = os.path.join(OUTPUT_DIR, 'walnut_v3_result.png')
+            cv2.imwrite(out_path, grid)
+            print(f'[OK] Saved -> {out_path}')
