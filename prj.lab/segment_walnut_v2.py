@@ -19,15 +19,15 @@ PARAM_ANCHORS = {
     'shell_pct':        [(69, 65),   (79, 75), (259, 88), (396, 80),  (408, 74),  (413, 65),  (420, 45),  (440, 50)],
 
     # Ядро: процентиль яркости для seeds
-    'seed_pct':         [(84, 55),   (89, 55), (90, 65), (94,65), (95, 70), (96, 65), (99, 65), (100, 85), (370, 85), (371, 92), (384, 96),    (500, 99)],
+    'seed_pct':         [(84, 55),   (89, 55), (90, 65), (94,65), (95, 70), (96, 65), (99, 65), (100, 85), (269, 85), (270, 70), (290, 70), (291, 85), (305, 70), (365, 70), (370, 85), (371, 92), (384, 96), (500, 99)],
 
     # Ядро: минимальная площадь лоба как доля от площади interior.
     # Анкоры сейчас даёт постоянное 0.015 — добавь точки чтобы настроить per-si.
-    'area_frac':        [(0, 0.015), (83, 0.015), (84, 0.02), (96, 0.025), (87, 0.02), (130, 0.025), (131,0.015), (500, 0.015)],
+    'area_frac':        [(0, 0.015), (83, 0.015), (84, 0.02), (96, 0.025), (87, 0.02), (130, 0.025), (131,0.015), (270, 0.015), (271, 0.005),(296, 0.005), (297, 0.015), (306, 0.015), (307, 0.006), (362, 0.006), (363, 0.015), (372, 0.010), (380, 0.010), (381, 0.010), (385, 0.015), (500, 0.015)],
 
     # Ядро: фильтр формы
-    'solidity_min':     [(0, 0.60),  (79, 0.50), (80, 0.55), (87, 0.57), (100, 0.59), (130, 0.65), (131, 0.55), (500, 0.55)],
-    'aspect_min':       [(0, 0.40),  (79, 0.40), (80, 0.35), (87, 0.50), (130, 0.55), (131, 0.35), (210, 0.35), (211, 0.20), (215, 0.25), (216,0.35), (229, 0.35), (230, 0.25), (269, 0.30), (270, 0.35), (286, 0.35), (287, 0.20), (305, 0.16), (317, 0.20), (318, 0.30), (500, 0.35)],
+    'solidity_min':     [(0, 0.60),  (79, 0.50), (80, 0.55), (87, 0.57), (100, 0.59), (130, 0.65), (131, 0.55), (299, 0.55), (300, 0.35), (400, 0.55), (500, 0.55)],
+    'aspect_min':       [(0, 0.40),  (79, 0.40), (80, 0.35), (87, 0.50), (130, 0.55), (131, 0.35), (210, 0.35), (211, 0.20), (215, 0.25), (216,0.35), (229, 0.35), (230, 0.25), (305, 0.15), (400, 0.15), (500, 0.35)],
 
     # Перегородки: пороги
     'frangi_pct':       [(65, 75),   (120, 20),  (259, 15), (300, 10)],
@@ -45,7 +45,7 @@ DT_PCT         = 80    # distance transform percentile (si <= 69)
 EXPAND_TOL     = 25    # BFS expand tolerance (si <= 69)
 SHELL_CLOSE_PX = 5     # morph close для si == 69
 HOLE_FRAC_MAX  = 0.10
-KERNEL_MIN_SI  = 84    # срезы ниже этого значения не имеют ядра (si <= 49)
+KERNEL_MIN_SI  = 70    # срезы ниже этого значения не имеют ядра (si <= 49)
 KERNEL_MAX_SI  = 383   # срезы выше этого значения не имеют ядра (si >= 384)
 
 # Partitions (стадия E) — структурные параметры (не зависят от si)
@@ -185,7 +185,7 @@ def build_shell(bl, mask, si, save=None):
 
     elif si >= 50:  # si 50-70: берём все компоненты с ratio >= 0.9 (скорлупа может быть в двух частях)
         for a, idx in areas:
-            if a >= max_area * 0.9:
+            if a >= max_area * 0.2:
                 shi[lb == idx] = 255
         shell = cv2.bitwise_or(shi, outer)
 
@@ -606,10 +606,46 @@ if __name__ == '__main__':
     OUTPUT_DIR = r'C:\masks_test\out'
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+    # Парсим числовые аргументы командной строки как диапазон si (например: 40 50)
+    numeric_args = [a for a in sys.argv[1:] if a.isdigit()]
+    si_range = None
+    if len(numeric_args) >= 2:
+        si_range = (int(numeric_args[0]), int(numeric_args[1]))
+    elif len(numeric_args) == 1:
+        si_range = (int(numeric_args[0]), int(numeric_args[0]))
+
     # Режим: 'all' — все файлы, 'test' — только выбранные срезы
     MODE = 'all'  # 'all' или 'test'
 
-    if MODE == 'all':
+    if si_range is not None:
+        # Обработать только срезы с si в диапазоне [si_range[0], si_range[1]]
+        si_lo, si_hi = si_range
+        print(f'[INFO] Диапазон si: {si_lo} — {si_hi}')
+        all_files = sorted(f for f in os.listdir(INPUT_DIR)
+                           if f.lower().endswith('.tiff') or f.lower().endswith('.tif'))
+        selected = []
+        for fname in all_files:
+            m = re.search(r'(\d+)(?=\.tiff?$)', fname, re.IGNORECASE)
+            if m and si_lo <= int(m.group(1)) <= si_hi:
+                selected.append(fname)
+        print(f'[INFO] Найдено срезов в диапазоне: {len(selected)}')
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        errors = 0
+        for fname in selected:
+            path = os.path.join(INPUT_DIR, fname)
+            debug_dir = os.path.join(OUTPUT_DIR, f'debug_{fname[:-5]}') if debug_mode else None
+            try:
+                r = process_slice(path, debug=debug_mode, output_dir=debug_dir)
+                ov = make_overlay(r)
+                out_path = os.path.join(OUTPUT_DIR, f'overlay_si{r["si"]:03d}.png')
+                cv2.imwrite(out_path, ov)
+                print(f'  [OK] overlay_si{r["si"]:03d}.png')
+            except Exception as e:
+                errors += 1
+                print(f'  [!] ошибка на {fname}: {e}')
+        print(f'Готово. Результаты: {OUTPUT_DIR}  Ошибок: {errors}')
+
+    elif MODE == 'all':
         # Обработать ВСЕ файлы в папке
         process_all(INPUT_DIR, OUTPUT_DIR, debug=debug_mode, progress_every=10)
 
