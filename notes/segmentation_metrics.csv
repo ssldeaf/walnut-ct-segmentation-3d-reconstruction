@@ -39,13 +39,12 @@ full_AGD_50_000363_kernel,0.918,0.849
 full_AGD_50_000363_septa,0.773,0.630
 full_AGD_50_000363_shell,0.876,0.779
 full_AGD_50_000383_septa,0.744,0.592
-full_AGD_50_000383_shell,0.839,0.723
 ,,
 kernel_mean,0.929,0.869
 kernel_std,0.016,0.028
 septa_mean,0.773,0.631
 septa_std,0.034,0.044
-shell_mean,0.882,0.789
-shell_std,0.016,0.025
-total_mean,0.860,0.760
-total_std,0.070,0.104
+shell_mean,0.885,0.795
+shell_std,0.010,0.017
+total_mean,0.860,0.761
+total_std,0.070,0.105
