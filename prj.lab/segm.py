@@ -354,6 +354,21 @@ def build_shell(bl, mask, si, save=None):
         cv2.drawContours(sf, [max(cs2, key=cv2.contourArea)], -1, 255, cv2.FILLED)
     if save: save('drawContours_shell_filled', sf)
     interior = cv2.bitwise_and(cv2.subtract(mask, shell), sf)
+    # Оставляем только крупнейшую связную компоненту interior:
+    # узкие места у неровной кромки скорлупы иногда отрезают мелкие
+    # «островки» начинки, которые не должны висеть отдельно от основной
+    # внутренней области. Порог в 1% от площади защищает от срезания
+    # настоящих долей на тех срезах, где interior естественно разделён.
+    ncc, lcc, scc, _ = cv2.connectedComponentsWithStats(
+        (interior > 0).astype(np.uint8), connectivity=8)
+    if ncc > 2:
+        comp_areas = [(scc[i, cv2.CC_STAT_AREA], i) for i in range(1, ncc)]
+        max_a = max(a for a, _ in comp_areas)
+        keep = np.zeros_like(interior)
+        for a, idx in comp_areas:
+            if a >= max(50, max_a * 0.01):
+                keep[lcc == idx] = 255
+        interior = keep
     if save: save('interior_result', interior)
     return shell, interior
 
