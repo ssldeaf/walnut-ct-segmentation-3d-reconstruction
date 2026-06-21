@@ -95,9 +95,6 @@ PARAM_ANCHORS = {
 # ── si-независимые параметры ───────────────────────────────────────────────
 # Kernel
 TOLERANCE      = 20    # region growing tolerance
-DT_PCT         = 80    # distance transform percentile (si <= 69)
-EXPAND_TOL     = 25    # BFS expand tolerance (si <= 69)
-SHELL_CLOSE_PX = 5     # morph close для si == 69
 HOLE_FRAC_MAX  = 0.20
 KERNEL_MIN_SI  = 70    # срезы ниже этого значения не имеют ядра (si <= 49)
 KERNEL_MAX_SI  = 383   # срезы выше этого значения не имеют ядра (si >= 384)
@@ -277,75 +274,15 @@ def build_shell(bl, mask, si, save=None):
                              accept_set=set(range(1, nl)),
                              reject_set=set()))
 
-    if si > 70:
-        accept_sh = {areas[0][1]}
-        reject_sh = {idx for _, idx in areas[1:]}
-        shi[lb == areas[0][1]] = 255
-        shell = cv2.bitwise_or(shi, outer)
-        if save:
-            save('filter_shell_largest',
-                 _debug_colorize(bl, lb, st, nl,
-                                 accept_set=accept_sh,
-                                 reject_set=reject_sh))
-
-    elif si >= 50:  # si 50-70: берём все компоненты с ratio >= 0.2
-        accept_sh = set()
-        reject_sh = set()
-        for a, idx in areas:
-            if a >= max_area * 0.2:
-                shi[lb == idx] = 255
-                accept_sh.add(idx)
-            else:
-                reject_sh.add(idx)
-        shell = cv2.bitwise_or(shi, outer)
-        if save:
-            save(f'filter_shell_ratio_0.2',
-                 _debug_colorize(bl, lb, st, nl,
-                                 accept_set=accept_sh,
-                                 reject_set=reject_sh))
-
-    else:  # si < 50
-        candidates = {}
-        reject_cand = set()
-        for a, idx in areas:
-            mb = float(bl[lb == idx].mean())
-            if a >= max_area * 0.05 or mb >= 135:
-                candidates[idx] = a
-            else:
-                reject_cand.add(idx)
-        if save:
-            save('filter_shell_candidates_bright',
-                 _debug_colorize(bl, lb, st, nl,
-                                 accept_set=set(candidates.keys()),
-                                 reject_set=reject_cand))
-        if len(candidates) > 1:
-            filled = {}
-            for idx in candidates:
-                comp = (lb == idx).astype(np.uint8) * 255
-                cs2, _ = cv2.findContours(comp, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                f = np.zeros_like(bl)
-                if cs2:
-                    cv2.drawContours(f, [max(cs2, key=cv2.contourArea)], -1, 255, cv2.FILLED)
-                filled[idx] = f
-            to_remove = set()
-            for idx_a in list(candidates.keys()):
-                for idx_b in list(candidates.keys()):
-                    if idx_a == idx_b or idx_b in to_remove:
-                        continue
-                    comp_a = (lb == idx_a).astype(np.uint8) * 255
-                    if (cv2.bitwise_and(comp_a, filled[idx_b]) > 0).sum() == (comp_a > 0).sum():
-                        to_remove.add(idx_a)
-            for idx in to_remove:
-                del candidates[idx]
-        for idx in candidates:
-            shi[lb == idx] = 255
-        shell = shi
-
-    if si <= 69:
-        k_cl = cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE, (2 * SHELL_CLOSE_PX + 1, 2 * SHELL_CLOSE_PX + 1))
-        shell = cv2.bitwise_and(cv2.morphologyEx(shell, cv2.MORPH_CLOSE, k_cl), mask)
-        if save: save('morphologyEx_close_shell', shell)
+    accept_sh = {areas[0][1]}
+    reject_sh = {idx for _, idx in areas[1:]}
+    shi[lb == areas[0][1]] = 255
+    shell = cv2.bitwise_or(shi, outer)
+    if save:
+        save('filter_shell_largest',
+             _debug_colorize(bl, lb, st, nl,
+                             accept_set=accept_sh,
+                             reject_set=reject_sh))
 
     if save: save('shell_result', shell)
     cs2, _ = cv2.findContours(shell, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -403,25 +340,6 @@ def region_growing(bl, interior, seed_pct):
     return cv2.bitwise_and(result, interior)
 
 
-def rg_from_seeds(bl, seeds, interior):
-    H, W = bl.shape
-    visited = seeds.astype(bool).copy()
-    result  = seeds.copy()
-    cv_ = bl[seeds > 0]
-    if len(cv_) == 0:
-        return result
-    gm = float(cv_.mean())
-    queue = deque(zip(*np.where(seeds > 0)))
-    while queue:
-        y, x = queue.popleft()
-        for dy, dx in [(-1,0),(1,0),(0,-1),(0,1)]:
-            ny, nx = y + dy, x + dx
-            if 0 <= ny < H and 0 <= nx < W and not visited[ny, nx] and interior[ny, nx] > 0:
-                if abs(float(bl[ny, nx]) - gm) <= EXPAND_TOL:
-                    visited[ny, nx] = True; result[ny, nx] = 255; queue.append((ny, nx))
-    return cv2.bitwise_and(result, interior)
-
-
 def shape_ok(comp_mask, sol_min, asp_min):
     a = float((comp_mask > 0).sum())
     cs, _ = cv2.findContours(comp_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -456,138 +374,99 @@ def build_kernel(bl, interior, si, save=None):
     sol_min = interp_param('solidity_min', si)
     asp_min = interp_param('aspect_min', si)
 
-    if si <= 69:
-        kernel_raw = region_growing(bl, interior, seed_pct)
-        if save: save('region_growing', kernel_raw)
-        dist = cv2.distanceTransform(kernel_raw, cv2.DIST_L2, 5)
-        dist_vis = cv2.normalize(dist, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-        if save: save('distanceTransform', dist_vis)
-        nz_d = dist[kernel_raw > 0]
-        dt_t = np.percentile(nz_d, DT_PCT) if len(nz_d) > 0 else 0
-        kernel_dt = cv2.bitwise_and((dist >= dt_t).astype(np.uint8) * 255, interior)
-        if save: save(f'threshold_dt_p{DT_PCT}', kernel_dt)
-        nl, lb, st, _ = cv2.connectedComponentsWithStats(kernel_dt, connectivity=8)
+    kernel_raw = region_growing(bl, interior, seed_pct)
+    if save: save('region_growing', kernel_raw)
+    nl, lb, st, _ = cv2.connectedComponentsWithStats(kernel_raw, connectivity=8)
 
-        # ── Debug: все компоненты DT ─────────────────────────────────
-        if save:
-            save('dt_all_components',
-                 _debug_colorize(bl, lb, st, nl,
-                                 accept_set=set(range(1, nl)),
-                                 reject_set=set(),
-                                 label_fn=lambda i: f"a={st[i, cv2.CC_STAT_AREA]}"))
+    # ── Вычислим метрики всех компонент заранее ───────────────────
+    metrics = {}        # i → dict
+    for i in range(1, nl):
+        comp = (lb == i).astype(np.uint8) * 255
+        metrics[i] = _comp_shape_metrics(comp)
+        metrics[i]['mean_bright'] = float(bl[lb == i].mean())
 
-        # ── Debug: фильтр площади DT ────────────────────────────────
-        pass_dt  = {i for i in range(1, nl) if st[i, cv2.CC_STAT_AREA] >= min_lobe}
-        reject_dt = {i for i in range(1, nl) if st[i, cv2.CC_STAT_AREA] < min_lobe}
-        if save:
-            save(f'dt_filter_area_min{min_lobe}',
-                 _debug_colorize(bl, lb, st, nl,
-                                 accept_set=pass_dt,
-                                 reject_set=reject_dt,
-                                 label_fn=lambda i: f"a={st[i, cv2.CC_STAT_AREA]}"))
+    # ── 1. Все компоненты (до фильтров) ──────────────────────────
+    if save:
+        save('all_components',
+             _debug_colorize(bl, lb, st, nl,
+                             accept_set=set(range(1, nl)),
+                             reject_set=set(),
+                             label_fn=lambda i: f"a={metrics[i]['area']:.0f}"))
 
-        centers = np.zeros_like(bl)
-        for i in pass_dt:
-            centers[lb == i] = 255
-        if save: save('centers_min_lobe', centers)
-        result = rg_from_seeds(bl, centers, interior)
-        if save: save('rg_from_seeds', result)
-        return result
+    # ── 2. Фильтр площади ────────────────────────────────────────
+    pass_area   = {i for i in range(1, nl) if metrics[i]['area'] >= min_lobe}
+    reject_area = {i for i in range(1, nl) if metrics[i]['area'] <  min_lobe}
+    if save:
+        save(f'filter_area_min{min_lobe}',
+             _debug_colorize(bl, lb, st, nl,
+                             accept_set=pass_area,
+                             reject_set=reject_area,
+                             label_fn=lambda i: f"a={metrics[i]['area']:.0f}"))
 
-    else:
-        kernel_raw = region_growing(bl, interior, seed_pct)
-        if save: save('region_growing', kernel_raw)
-        nl, lb, st, _ = cv2.connectedComponentsWithStats(kernel_raw, connectivity=8)
+    # ── 3. Фильтр solidity ───────────────────────────────────────
+    pass_sol   = {i for i in pass_area if metrics[i]['solidity'] >= sol_min}
+    reject_sol = {i for i in pass_area if metrics[i]['solidity'] <  sol_min}
+    if save:
+        save(f'filter_solidity_min{sol_min:.2f}',
+             _debug_colorize(bl, lb, st, nl,
+                             accept_set=pass_sol,
+                             reject_set=reject_sol,
+                             label_fn=lambda i: f"sol={metrics[i]['solidity']:.2f}"
+                                      if i in pass_area else None))
 
-        # ── Вычислим метрики всех компонент заранее ───────────────────
-        metrics = {}        # i → dict
-        for i in range(1, nl):
-            comp = (lb == i).astype(np.uint8) * 255
-            metrics[i] = _comp_shape_metrics(comp)
-            metrics[i]['mean_bright'] = float(bl[lb == i].mean())
+    # ── 4. Фильтр aspect ────────────────────────────────────────
+    pass_asp   = {i for i in pass_area if metrics[i]['aspect'] >= asp_min}
+    reject_asp = {i for i in pass_area if metrics[i]['aspect'] <  asp_min}
+    if save:
+        save(f'filter_aspect_min{asp_min:.2f}',
+             _debug_colorize(bl, lb, st, nl,
+                             accept_set=pass_asp,
+                             reject_set=reject_asp,
+                             label_fn=lambda i: f"asp={metrics[i]['aspect']:.2f}"
+                                      if i in pass_area else None))
 
-        # ── 1. Все компоненты (до фильтров) ──────────────────────────
-        if save:
-            save('all_components',
-                 _debug_colorize(bl, lb, st, nl,
-                                 accept_set=set(range(1, nl)),
-                                 reject_set=set(),
-                                 label_fn=lambda i: f"a={metrics[i]['area']:.0f}"))
+    # ── 5. Фильтр hole_frac ──────────────────────────────────────
+    pass_hf   = {i for i in pass_area if metrics[i]['hole_frac'] <= HOLE_FRAC_MAX}
+    reject_hf = {i for i in pass_area if metrics[i]['hole_frac'] >  HOLE_FRAC_MAX}
+    if save:
+        save(f'filter_holefrac_max{HOLE_FRAC_MAX:.2f}',
+             _debug_colorize(bl, lb, st, nl,
+                             accept_set=pass_hf,
+                             reject_set=reject_hf,
+                             label_fn=lambda i: f"hf={metrics[i]['hole_frac']:.2f}"
+                                      if i in pass_area else None))
 
-        # ── 2. Фильтр площади ────────────────────────────────────────
-        pass_area   = {i for i in range(1, nl) if metrics[i]['area'] >= min_lobe}
-        reject_area = {i for i in range(1, nl) if metrics[i]['area'] <  min_lobe}
-        if save:
-            save(f'filter_area_min{min_lobe}',
-                 _debug_colorize(bl, lb, st, nl,
-                                 accept_set=pass_area,
-                                 reject_set=reject_area,
-                                 label_fn=lambda i: f"a={metrics[i]['area']:.0f}"))
+    # ── 6. Итого: пересечение всех фильтров ─────────────────────
+    pass_all = pass_sol & pass_asp & pass_hf    # все три → ОК
+    reject_any = pass_area - pass_all            # прошли площадь, но не форму
+    if save:
+        save('filter_shape_combined',
+             _debug_colorize(bl, lb, st, nl,
+                             accept_set=pass_all,
+                             reject_set=reject_any,
+                             label_fn=lambda i: (
+                                 f"s={metrics[i]['solidity']:.2f} "
+                                 f"a={metrics[i]['aspect']:.2f} "
+                                 f"h={metrics[i]['hole_frac']:.2f}"
+                             ) if i in pass_area else None))
 
-        # ── 3. Фильтр solidity ───────────────────────────────────────
-        pass_sol   = {i for i in pass_area if metrics[i]['solidity'] >= sol_min}
-        reject_sol = {i for i in pass_area if metrics[i]['solidity'] <  sol_min}
-        if save:
-            save(f'filter_solidity_min{sol_min:.2f}',
-                 _debug_colorize(bl, lb, st, nl,
-                                 accept_set=pass_sol,
-                                 reject_set=reject_sol,
-                                 label_fn=lambda i: f"sol={metrics[i]['solidity']:.2f}"
-                                          if i in pass_area else None))
+    # ── 7. Фильтр яркости (информационный) ──────────────────────
+    if save:
+        save('brightness_map',
+             _debug_colorize(bl, lb, st, nl,
+                             accept_set=pass_area,
+                             reject_set=set(),
+                             label_fn=lambda i: f"br={metrics[i]['mean_bright']:.0f}"
+                                      if i in pass_area else None))
 
-        # ── 4. Фильтр aspect ────────────────────────────────────────
-        pass_asp   = {i for i in pass_area if metrics[i]['aspect'] >= asp_min}
-        reject_asp = {i for i in pass_area if metrics[i]['aspect'] <  asp_min}
-        if save:
-            save(f'filter_aspect_min{asp_min:.2f}',
-                 _debug_colorize(bl, lb, st, nl,
-                                 accept_set=pass_asp,
-                                 reject_set=reject_asp,
-                                 label_fn=lambda i: f"asp={metrics[i]['aspect']:.2f}"
-                                          if i in pass_area else None))
-
-        # ── 5. Фильтр hole_frac ──────────────────────────────────────
-        pass_hf   = {i for i in pass_area if metrics[i]['hole_frac'] <= HOLE_FRAC_MAX}
-        reject_hf = {i for i in pass_area if metrics[i]['hole_frac'] >  HOLE_FRAC_MAX}
-        if save:
-            save(f'filter_holefrac_max{HOLE_FRAC_MAX:.2f}',
-                 _debug_colorize(bl, lb, st, nl,
-                                 accept_set=pass_hf,
-                                 reject_set=reject_hf,
-                                 label_fn=lambda i: f"hf={metrics[i]['hole_frac']:.2f}"
-                                          if i in pass_area else None))
-
-        # ── 6. Итого: пересечение всех фильтров ─────────────────────
-        pass_all = pass_sol & pass_asp & pass_hf    # все три → ОК
-        reject_any = pass_area - pass_all            # прошли площадь, но не форму
-        if save:
-            save('filter_shape_combined',
-                 _debug_colorize(bl, lb, st, nl,
-                                 accept_set=pass_all,
-                                 reject_set=reject_any,
-                                 label_fn=lambda i: (
-                                     f"s={metrics[i]['solidity']:.2f} "
-                                     f"a={metrics[i]['aspect']:.2f} "
-                                     f"h={metrics[i]['hole_frac']:.2f}"
-                                 ) if i in pass_area else None))
-
-        # ── 7. Фильтр яркости (информационный) ──────────────────────
-        if save:
-            save('brightness_map',
-                 _debug_colorize(bl, lb, st, nl,
-                                 accept_set=pass_area,
-                                 reject_set=set(),
-                                 label_fn=lambda i: f"br={metrics[i]['mean_bright']:.0f}"
-                                          if i in pass_area else None))
-
-        # ── Собираем результат ────────────────────────────────────────
-        out = np.zeros_like(bl)
-        for i in pass_all:
-            out[lb == i] = 255
-        if save: save('shape_filter', out)
-        result = cv2.bitwise_and(out, interior)
-        if save: save('kernel_result', result)
-        return result
+    # ── Собираем результат ────────────────────────────────────────
+    out = np.zeros_like(bl)
+    for i in pass_all:
+        out[lb == i] = 255
+    if save: save('shape_filter', out)
+    result = cv2.bitwise_and(out, interior)
+    if save: save('kernel_result', result)
+    return result
 
 
 # ── Стадия D: маска перегородок ────────────────────────────────────────────
